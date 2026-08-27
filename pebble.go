@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/spf13/cast"
 )
 
@@ -77,25 +78,57 @@ type PebbleDB struct {
 
 var _ DB = (*PebbleDB)(nil)
 
-func NewPebbleDB(name, dir string, opts Options) (DB, error) {
+func pebbleOptions() *pebble.Options {
 	do := &pebble.Options{
 		Logger: &fatalLogger{}, // pebble info logs are messing up the logs
 		// (not a cosmossdk.io/log logger)
-		MaxConcurrentCompactions: func() int { return 3 }, // default 1
-		// Unset, pebble settles on FormatMostCompatible and leaves it there
-		// for the database's whole life, which pebble v2 refuses to open --
-		// and refuses before it would migrate anything, so no v2 build can do
-		// this for itself. Upgrading here readies a node for that bump instead
-		// of failing to start after it.
-		//
-		// FlushableIngest rather than FormatNewest is exactly what v2 needs:
-		// the next version up holds the open until every table predating the
-		// Pebblev1 format has been rewritten, which here is all of them.
-		// Stopping short leaves those to ordinary compaction.
-		FormatMajorVersion: pebble.FormatFlushableIngest,
+		// v2 splits the old MaxConcurrentCompactions cap into a baseline and a
+		// heuristic ceiling; hold both at the 3 it used to be.
+		CompactionConcurrencyRange: func() (int, int) { return 3, 3 }, // default 1, 1
+		// No FormatMajorVersion: EnsureDefaults asks for FormatMinSupported,
+		// which is the version the ratchet release left databases at, so
+		// nothing moves. Naming FormatNewest here would carry them to a
+		// version no v1 build can open, and with it the way back.
 	}
 
+	// EnsureDefaults routes a failed compaction or flush to the logger's
+	// Errorf and corruption to its Fatalf, so no listener of our own. Ending
+	// the process on corruption is what we want: a database that keeps serving
+	// past damage it cannot read diverges without saying so.
 	do.EnsureDefaults()
+	return do
+}
+
+// withUpgradeHint says what to do about a database this build will not open.
+//
+// pebble's own report is accurate and useless in the same breath: it names the
+// format and says it is no longer supported, and stops there. The way out is
+// not something an operator can work out from that, because the obvious move
+// -- run the new build and let it migrate -- is the one thing that cannot
+// work. The version is rejected before any migration would run, so nothing on
+// this side of the upgrade can repair it. Only the release before this one
+// can, and it does so just by being started.
+//
+// Matched on the text because pebble raises it with errors.Newf, with no
+// sentinel to compare against. Both wordings it uses carry these two phrases;
+// missing the match costs the hint, not the error.
+func withUpgradeHint(err error) error {
+	msg := err.Error()
+	if !strings.Contains(msg, "format major version") ||
+		!strings.Contains(msg, "no longer supported") {
+		return err
+	}
+	return fmt.Errorf("%w"+
+		"\n\nthis database predates the pebble format this build requires, and"+
+		"\nthis build cannot upgrade it: the version is refused before any"+
+		"\nmigration would run. Start the node once on the previous release,"+
+		"\nwhich moves the format forward as it opens, then return to this one."+
+		"\nNothing has been changed on disk -- pebble stops before it writes.",
+		err)
+}
+
+func NewPebbleDB(name, dir string, opts Options) (DB, error) {
+	do := pebbleOptions()
 
 	if opts != nil {
 		files := cast.ToInt(opts.Get("maxopenfiles"))
@@ -107,7 +140,7 @@ func NewPebbleDB(name, dir string, opts Options) (DB, error) {
 	dbPath := filepath.Join(dir, name+DBFileSuffix)
 	p, err := pebble.Open(dbPath, do)
 	if err != nil {
-		return nil, err
+		return nil, withUpgradeHint(err)
 	}
 	return &PebbleDB{
 		db: p,
@@ -511,3 +544,9 @@ func (*fatalLogger) Fatalf(format string, args ...interface{}) {
 }
 
 func (*fatalLogger) Infof(_ string, _ ...interface{}) {}
+
+// Errorf has to be spelled out: v2 calls it where v1 never did, and the
+// embedded Logger it would otherwise reach is nil.
+func (*fatalLogger) Errorf(format string, args ...interface{}) {
+	pebble.DefaultLogger.Errorf(format, args...)
+}
