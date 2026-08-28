@@ -81,9 +81,10 @@ func pebbleOptions() *pebble.Options {
 	do := &pebble.Options{
 		Logger: &fatalLogger{}, // pebble info logs are messing up the logs
 		// (not a cosmossdk.io/log logger)
-		// v2 splits the old MaxConcurrentCompactions cap into a baseline and a
-		// heuristic ceiling; hold both at the 3 it used to be.
-		CompactionConcurrencyRange: func() (int, int) { return 3, 3 }, // default 1, 1
+		// v2 splits the old MaxConcurrentCompactions into a baseline and a
+		// heuristic ceiling. The old 3 was only the ceiling: keep the baseline
+		// at its default of 1, or every store compacts three ways all the time.
+		CompactionConcurrencyRange: func() (int, int) { return 1, 3 }, // default 1, 1
 	}
 
 	// EnsureDefaults routes a failed compaction or flush to the logger's
